@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,6 +29,7 @@ import (
 	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/goxpusmi"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/gpu/device"
@@ -41,11 +43,19 @@ type driver struct {
 	state      *nodeState
 	helper     *kubeletplugin.Helper
 	healthcare bool
+
+	// Health streaming support
+	healthStreams      map[int]chan *drahealthv1alpha1.NodeWatchResourcesResponse
+	healthStreamsMutex sync.RWMutex
+	healthStreamID     int
+
+	// Embed unimplemented server for forward compatibility
+	drahealthv1alpha1.UnimplementedDRAResourceHealthServer
 }
 
 func (d *driver) PublishResourceSlice(ctx context.Context) error {
 	resources := d.state.GetResources()
-	klog.FromContext(ctx).Info("Publishing resources", "len", len(resources.Pools[d.state.NodeName].Slices[0].Devices))
+	klog.Infof("Publishing resources, len: %d", len(resources.Pools[d.state.NodeName].Slices[0].Devices))
 	klog.V(5).Infof("devices: %+v", resources.Pools[d.state.NodeName].Slices[0].Devices)
 	if err := d.helper.PublishResources(ctx, resources); err != nil {
 		return fmt.Errorf("error publishing resources: %v", err)
@@ -83,7 +93,8 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 			},
 			ignoreHealthWarning: gpuFlags.IgnoreHealthWarning,
 		},
-		healthcare: gpuFlags.Healthcare,
+		healthcare:    gpuFlags.Healthcare,
+		healthStreams: make(map[int]chan *drahealthv1alpha1.NodeWatchResourcesResponse),
 	}
 
 	klog.V(5).Infof("Prepared claims: %v", driver.state)
@@ -207,10 +218,52 @@ func (d *driver) Shutdown(ctx context.Context) error {
 func (d *driver) HandleError(ctx context.Context, err error, message string) {
 	if errors.Is(err, kubeletplugin.ErrRecoverable) {
 		// TODO: FIXME: error is ignored ATM, handle it properly.
-		klog.FromContext(ctx).Error(err, "DRAPlugin encountered an error.")
+		klog.Errorf("DRAPlugin encountered an error: %v", err)
 	} else {
-		klog.FromContext(ctx).Error(err, "Unrecoverable error.")
+		klog.Errorf("Unrecoverable error: %v", err)
 	}
 
 	runtime.HandleErrorWithContext(ctx, err, message)
+}
+
+// NodeWatchResources implements the DRAResourceHealth gRPC service.
+// It streams health status updates for all devices managed by this driver.
+// The implementation logic is in healthcare.go.
+func (d *driver) NodeWatchResources(
+	req *drahealthv1alpha1.NodeWatchResourcesRequest,
+	stream drahealthv1alpha1.DRAResourceHealth_NodeWatchResourcesServer,
+) error {
+	ctx := stream.Context()
+	klog.Info("NodeWatchResources stream started")
+
+	streamCh := make(chan *drahealthv1alpha1.NodeWatchResourcesResponse, 10)
+
+	// Register the stream (implemented in healthcare.go)
+	streamID := d.registerHealthStream(streamCh)
+	defer d.unregisterHealthStream(streamID)
+
+	// Send initial health status for all devices
+	if err := d.sendCurrentHealthStatus(ctx, stream); err != nil {
+		klog.Errorf("Failed to send initial health status: %v", err)
+		return err
+	}
+
+	// Keep the stream open and send updates
+	for {
+		select {
+		case <-ctx.Done():
+			klog.Info("NodeWatchResources stream closed by client")
+			return ctx.Err()
+		case response, ok := <-streamCh:
+			if !ok {
+				klog.Info("Health stream channel closed")
+				return nil
+			}
+			if err := stream.Send(response); err != nil {
+				klog.Errorf("Failed to send health update: %v", err)
+				return err
+			}
+			klog.V(5).Infof("Sent health update, devices: %d", len(response.Devices))
+		}
+	}
 }

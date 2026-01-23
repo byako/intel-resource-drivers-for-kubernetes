@@ -1,0 +1,30 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-health-test-claim
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.intel.com
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-health-test-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gpu-health-test-claim
+  containers:
+  - name: test
+    image: ubuntu:22.04
+    command: ["sleep", "3600"]
+    resources:
+      claims:
+      - name: gpu

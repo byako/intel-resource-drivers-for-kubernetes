@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - path: add-health-monitoring-args.yaml
+    target:
+      kind: DaemonSet
+      name: intel-gpu-resource-driver-kubelet-plugin
+
+images:
+  - name: ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-gpu-resource-driver
+    newName: registry.local/intel-gpu-resource-driver
+    newTag: v0.9.1

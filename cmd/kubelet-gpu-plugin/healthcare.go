@@ -2,19 +2,19 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"k8s.io/klog/v2"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/goxpusmi"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/gpu/device"
 )
 
-// HealthStatusUpdates is a type alias for map[deviceUID]map[healthType]status.
 type HealthStatusUpdates map[string]map[string]string
 
 func (d *driver) startHealthMonitor(ctx context.Context, gpuFlags *GPUFlags) {
-	// Channel carries per-interval health status deltas keyed by device UID.
 	healthStatusUpdatesCh := make(chan HealthStatusUpdates)
 	goxpusmiCtx, stopMonitor := context.WithCancel(ctx)
 	go d.watchGPUHealthStatuses(goxpusmiCtx, gpuFlags, healthStatusUpdatesCh)
@@ -33,7 +33,6 @@ func (d *driver) startHealthMonitor(ctx context.Context, gpuFlags *GPUFlags) {
 
 func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthStatusUpdates) {
 	d.state.Lock()
-	defer d.state.Unlock()
 	//nolint:forcetypeassert // We want the code to panic if our assumption turns out to be wrong.
 	allocatable := d.state.Allocatable.(map[string]*device.DeviceInfo)
 	for deviceUID, healthStatus := range healthStatusUpdates {
@@ -41,6 +40,7 @@ func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthSta
 		foundDevice, found := allocatable[deviceUID]
 		if !found {
 			klog.Errorf("could not find allocatable device with UID %v", deviceUID)
+			d.state.Unlock()
 			return
 		}
 
@@ -56,11 +56,14 @@ func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthSta
 		}
 		foundDevice.Healthy = isHealthy
 	}
-	// Health is updated from a go routine, nothing we can do when publishing
-	// resource slice fails, so error is only logged.
+	d.state.Unlock()
+
 	if err := d.PublishResourceSlice(ctx); err != nil {
 		klog.Errorf("could not publish updated resource slice: %v", err)
 	}
+
+	// Broadcast health update to all connected health streams
+	d.broadcastHealthUpdate()
 }
 
 // watchGPUHealthStatuses polls XPUM metric health info and sends per-interval
@@ -96,5 +99,101 @@ func (d *driver) watchGPUHealthStatuses(ctx context.Context, gpuFlags *GPUFlags,
 				healthStatusUpdatesCh <- updates
 			}
 		}
+	}
+}
+
+// registerHealthStream registers a new health stream
+func (d *driver) registerHealthStream(ch chan *drahealthv1alpha1.NodeWatchResourcesResponse) int {
+	d.healthStreamsMutex.Lock()
+	defer d.healthStreamsMutex.Unlock()
+
+	d.healthStreamID++
+	streamID := d.healthStreamID
+	d.healthStreams[streamID] = ch
+	klog.V(3).Infof("Registered health stream %d, total streams: %d", streamID, len(d.healthStreams))
+	return streamID
+}
+
+// unregisterHealthStream removes a health stream by ID
+func (d *driver) unregisterHealthStream(streamID int) {
+	d.healthStreamsMutex.Lock()
+	defer d.healthStreamsMutex.Unlock()
+
+	if ch, exists := d.healthStreams[streamID]; exists {
+		close(ch)
+		delete(d.healthStreams, streamID)
+		klog.V(3).Infof("Unregistered health stream %d, remaining streams: %d", streamID, len(d.healthStreams))
+	}
+}
+
+// sendCurrentHealthStatus sends the current health status of all devices to a stream
+func (d *driver) sendCurrentHealthStatus(ctx context.Context, stream drahealthv1alpha1.DRAResourceHealth_NodeWatchResourcesServer) error {
+	response := d.buildHealthResponse()
+	if err := stream.Send(response); err != nil {
+		return fmt.Errorf("failed to send health status: %w", err)
+	}
+	klog.Infof("Sent initial health status, devices: %d", len(response.Devices))
+	return nil
+}
+
+// broadcastHealthUpdate sends a health update to all registered streams
+func (d *driver) broadcastHealthUpdate() {
+	response := d.buildHealthResponse()
+
+	d.healthStreamsMutex.RLock()
+	defer d.healthStreamsMutex.RUnlock()
+
+	klog.V(5).Infof("Broadcasting health update to %d streams", len(d.healthStreams))
+	for streamID, ch := range d.healthStreams {
+		select {
+		case ch <- response:
+			klog.V(5).Infof("Sent health update to stream %d", streamID)
+		default:
+			klog.Warningf("Stream %d buffer full, skipping update", streamID)
+		}
+	}
+}
+
+// buildHealthResponse builds a NodeWatchResourcesResponse with current health status
+func (d *driver) buildHealthResponse() *drahealthv1alpha1.NodeWatchResourcesResponse {
+	d.state.Lock()
+	defer d.state.Unlock()
+
+	devices := make([]*drahealthv1alpha1.DeviceHealth, 0)
+
+	allocatable, ok := d.state.Allocatable.(map[string]*device.DeviceInfo)
+	if !ok {
+		klog.Warning("Allocatable devices not in expected format")
+		return &drahealthv1alpha1.NodeWatchResourcesResponse{Devices: devices}
+	}
+
+	for _, dev := range allocatable {
+		deviceHealth := d.deviceInfoToDeviceHealth(dev)
+		devices = append(devices, deviceHealth)
+	}
+
+	klog.V(5).Infof("Built health response with %d devices", len(devices))
+	return &drahealthv1alpha1.NodeWatchResourcesResponse{Devices: devices}
+}
+
+// deviceInfoToDeviceHealth converts a DeviceInfo to a DeviceHealth message
+func (d *driver) deviceInfoToDeviceHealth(dev *device.DeviceInfo) *drahealthv1alpha1.DeviceHealth {
+	healthStatus := drahealthv1alpha1.HealthStatus_HEALTHY
+	if !dev.Healthy {
+		healthStatus = drahealthv1alpha1.HealthStatus_UNHEALTHY
+	}
+
+	// If health monitoring is not enabled or no health status available, mark as UNKNOWN
+	if !d.healthcare || dev.HealthStatus == nil {
+		healthStatus = drahealthv1alpha1.HealthStatus_UNKNOWN
+	}
+
+	return &drahealthv1alpha1.DeviceHealth{
+		Device: &drahealthv1alpha1.DeviceIdentifier{
+			PoolName:   d.state.NodeName,
+			DeviceName: dev.UID,
+		},
+		Health:          healthStatus,
+		LastUpdatedTime: time.Now().Unix(),
 	}
 }
