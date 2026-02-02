@@ -238,17 +238,17 @@ func (d *driver) NodeWatchResources(
 
 	streamCh := make(chan *drahealthv1alpha1.NodeWatchResourcesResponse, 10)
 
-	// Register the stream (implemented in healthcare.go)
+	// Register the stream (implemented in healthcare.go).
 	streamID := d.registerHealthStream(streamCh)
 	defer d.unregisterHealthStream(streamID)
 
-	// Send initial health status for all devices
+	// Send initial health status for all devices.
 	if err := d.sendCurrentHealthStatus(ctx, stream); err != nil {
 		klog.Errorf("Failed to send initial health status: %v", err)
 		return err
 	}
 
-	// Keep the stream open and send updates
+	// Keep the stream open and send updates.
 	for {
 		select {
 		case <-ctx.Done():

@@ -9,8 +9,3 @@ patches:
     target:
       kind: DaemonSet
       name: intel-gpu-resource-driver-kubelet-plugin
-
-images:
-  - name: ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-gpu-resource-driver
-    newName: registry.local/intel-gpu-resource-driver
-    newTag: v0.9.1

@@ -32,38 +32,50 @@ func (d *driver) startHealthMonitor(ctx context.Context, gpuFlags *GPUFlags) {
 }
 
 func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthStatusUpdates) {
-	d.state.Lock()
-	//nolint:forcetypeassert // We want the code to panic if our assumption turns out to be wrong.
-	allocatable := d.state.Allocatable.(map[string]*device.DeviceInfo)
-	for deviceUID, healthStatus := range healthStatusUpdates {
-		klog.Infof("Updating info for device %v to status=%v", deviceUID, healthStatus)
-		foundDevice, found := allocatable[deviceUID]
-		if !found {
-			klog.Errorf("could not find allocatable device with UID %v", deviceUID)
-			d.state.Unlock()
-			return
+	response, ok := func() (*drahealthv1alpha1.NodeWatchResourcesResponse, bool) {
+		d.state.Lock()
+		defer d.state.Unlock()
+
+		allocatable, ok := d.state.Allocatable.(map[string]*device.DeviceInfo)
+		if !ok {
+			klog.Error("allocatable devices not in expected format")
+			return nil, false
+		}
+		for deviceUID, healthStatus := range healthStatusUpdates {
+			klog.Infof("Updating info for device %v to status=%v", deviceUID, healthStatus)
+			foundDevice, found := allocatable[deviceUID]
+			if !found {
+				klog.Errorf("could not find allocatable device with UID %v", deviceUID)
+				return nil, false
+			}
+
+			// Determine overall health: healthy unless any status is CRITICAL.
+			isHealthy := true
+			if foundDevice.HealthStatus == nil {
+				foundDevice.HealthStatus = make(map[string]string)
+			}
+			for healthType, status := range healthStatusUpdates[deviceUID] {
+				foundDevice.HealthStatus[healthType] = status
+				health := d.state.StatusHealth(status)
+				isHealthy = isHealthy && health
+			}
+			foundDevice.Healthy = isHealthy
 		}
 
-		// Determine overall health: healthy unless any status is CRITICAL.
-		isHealthy := true
-		if foundDevice.HealthStatus == nil {
-			foundDevice.HealthStatus = make(map[string]string)
-		}
-		for healthType, status := range healthStatusUpdates[deviceUID] {
-			foundDevice.HealthStatus[healthType] = status
-			health := d.state.StatusHealth(status)
-			isHealthy = isHealthy && health
-		}
-		foundDevice.Healthy = isHealthy
+		// Build health response while still holding the lock to ensure consistency.
+		return d.buildHealthResponseLocked(), true
+	}()
+
+	if !ok {
+		return
 	}
-	d.state.Unlock()
 
 	if err := d.PublishResourceSlice(ctx); err != nil {
 		klog.Errorf("could not publish updated resource slice: %v", err)
 	}
 
-	// Broadcast health update to all connected health streams
-	d.broadcastHealthUpdate()
+	// Broadcast health update to all connected health streams.
+	d.broadcastHealthUpdateWithResponse(response)
 }
 
 // watchGPUHealthStatuses polls XPUM metric health info and sends per-interval
@@ -102,7 +114,7 @@ func (d *driver) watchGPUHealthStatuses(ctx context.Context, gpuFlags *GPUFlags,
 	}
 }
 
-// registerHealthStream registers a new health stream
+// registerHealthStream registers a new health stream.
 func (d *driver) registerHealthStream(ch chan *drahealthv1alpha1.NodeWatchResourcesResponse) int {
 	d.healthStreamsMutex.Lock()
 	defer d.healthStreamsMutex.Unlock()
@@ -114,7 +126,7 @@ func (d *driver) registerHealthStream(ch chan *drahealthv1alpha1.NodeWatchResour
 	return streamID
 }
 
-// unregisterHealthStream removes a health stream by ID
+// unregisterHealthStream removes a health stream by ID.
 func (d *driver) unregisterHealthStream(streamID int) {
 	d.healthStreamsMutex.Lock()
 	defer d.healthStreamsMutex.Unlock()
@@ -126,7 +138,7 @@ func (d *driver) unregisterHealthStream(streamID int) {
 	}
 }
 
-// sendCurrentHealthStatus sends the current health status of all devices to a stream
+// sendCurrentHealthStatus sends the current health status of all devices to a stream.
 func (d *driver) sendCurrentHealthStatus(ctx context.Context, stream drahealthv1alpha1.DRAResourceHealth_NodeWatchResourcesServer) error {
 	response := d.buildHealthResponse()
 	if err := stream.Send(response); err != nil {
@@ -136,10 +148,8 @@ func (d *driver) sendCurrentHealthStatus(ctx context.Context, stream drahealthv1
 	return nil
 }
 
-// broadcastHealthUpdate sends a health update to all registered streams
-func (d *driver) broadcastHealthUpdate() {
-	response := d.buildHealthResponse()
-
+// broadcastHealthUpdateWithResponse sends a health update to all registered streams.
+func (d *driver) broadcastHealthUpdateWithResponse(response *drahealthv1alpha1.NodeWatchResourcesResponse) {
 	d.healthStreamsMutex.RLock()
 	defer d.healthStreamsMutex.RUnlock()
 
@@ -154,11 +164,18 @@ func (d *driver) broadcastHealthUpdate() {
 	}
 }
 
-// buildHealthResponse builds a NodeWatchResourcesResponse with current health status
+// buildHealthResponse builds a NodeWatchResourcesResponse with current health status.
+// This function uses the state lock.
 func (d *driver) buildHealthResponse() *drahealthv1alpha1.NodeWatchResourcesResponse {
 	d.state.Lock()
 	defer d.state.Unlock()
 
+	return d.buildHealthResponseLocked()
+}
+
+// buildHealthResponseLocked builds a NodeWatchResourcesResponse with current health status.
+// Caller must hold d.state lock.
+func (d *driver) buildHealthResponseLocked() *drahealthv1alpha1.NodeWatchResourcesResponse {
 	devices := make([]*drahealthv1alpha1.DeviceHealth, 0)
 
 	allocatable, ok := d.state.Allocatable.(map[string]*device.DeviceInfo)
@@ -176,19 +193,24 @@ func (d *driver) buildHealthResponse() *drahealthv1alpha1.NodeWatchResourcesResp
 	return &drahealthv1alpha1.NodeWatchResourcesResponse{Devices: devices}
 }
 
-// deviceInfoToDeviceHealth converts a DeviceInfo to a DeviceHealth message
+// deviceInfoToDeviceHealth converts a DeviceInfo to a DeviceHealth message.
 func (d *driver) deviceInfoToDeviceHealth(dev *device.DeviceInfo) *drahealthv1alpha1.DeviceHealth {
-	healthStatus := drahealthv1alpha1.HealthStatus_HEALTHY
-	if !dev.Healthy {
-		healthStatus = drahealthv1alpha1.HealthStatus_UNHEALTHY
-	}
+	var healthStatus drahealthv1alpha1.HealthStatus
 
-	// If health monitoring is not enabled or no health status available, mark as UNKNOWN
-	if !d.healthcare || dev.HealthStatus == nil {
+	if !d.healthcare {
+		// Health monitoring is not enabled (either disabled via flag or xpu-smi failed to initialize).
 		healthStatus = drahealthv1alpha1.HealthStatus_UNKNOWN
+	} else {
+		// Health monitoring is enabled, use dev.Healthy as the source of truth
+		// dev.Healthy is initially set from discovery and updated by health monitoring loop.
+		if dev.Healthy {
+			healthStatus = drahealthv1alpha1.HealthStatus_HEALTHY
+		} else {
+			healthStatus = drahealthv1alpha1.HealthStatus_UNHEALTHY
+		}
 	}
 
-	return &drahealthv1alpha1.DeviceHealth{
+	deviceHealth := &drahealthv1alpha1.DeviceHealth{
 		Device: &drahealthv1alpha1.DeviceIdentifier{
 			PoolName:   d.state.NodeName,
 			DeviceName: dev.UID,
@@ -196,4 +218,9 @@ func (d *driver) deviceInfoToDeviceHealth(dev *device.DeviceInfo) *drahealthv1al
 		Health:          healthStatus,
 		LastUpdatedTime: time.Now().Unix(),
 	}
+
+	klog.V(3).Infof("Building health for device: pool=%s, device=%s, healthy=%v, healthStatus=%v, healthcare=%v",
+		d.state.NodeName, dev.UID, dev.Healthy, healthStatus, d.healthcare)
+
+	return deviceHealth
 }
