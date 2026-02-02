@@ -228,6 +228,66 @@ func TestUpdateHealth(t *testing.T) {
 	}
 }
 
+func TestBuildHealthResponseLocked_InvalidAllocatableType(t *testing.T) {
+	testDirs, err := testhelpers.NewTestDirs(gpudevice.DriverName)
+	defer testhelpers.CleanupTest(t, "GPU TestBuildHealthResponseLocked_InvalidAllocatableType", testDirs.TestRoot)
+	if err != nil {
+		t.Fatalf("setup error creating test dirs: %v", err)
+	}
+
+	testDevices := gpudevice.DevicesInfo{
+		"0000-00-02-0-0x56c0": {Model: "0x56c0", MemoryMiB: 8192, DeviceType: "gpu", CardIdx: 0, RenderdIdx: 128, UID: "0000-00-02-0-0x56c0", MaxVFs: 16, Driver: "i915"},
+	}
+	if err := fakesysfs.FakeSysFsGpuContents(testDirs.SysfsRoot, testDirs.DevfsRoot, testDevices, false); err != nil {
+		t.Fatalf("could not create fake sysfs: %v", err)
+	}
+
+	drv, err := getFakeDriver(testDirs)
+	if err != nil {
+		t.Fatalf("could not create fake driver: %v", err)
+	}
+	defer func() { _ = drv.Shutdown(context.TODO()) }()
+
+	// Set Allocatable to invalid type to test defensive check.
+	drv.state.Allocatable = "invalid type"
+
+	response := drv.buildHealthResponse()
+	if len(response.Devices) != 0 {
+		t.Fatalf("expected empty devices list, got %d", len(response.Devices))
+	}
+}
+
+func TestUpdateHealth_InvalidAllocatableType(t *testing.T) {
+	testDirs, err := testhelpers.NewTestDirs(gpudevice.DriverName)
+	defer testhelpers.CleanupTest(t, "GPU TestUpdateHealth_InvalidAllocatableType", testDirs.TestRoot)
+	if err != nil {
+		t.Fatalf("setup error creating test dirs: %v", err)
+	}
+
+	testDevices := gpudevice.DevicesInfo{
+		"0000-00-02-0-0x56c0": {Model: "0x56c0", MemoryMiB: 8192, DeviceType: "gpu", CardIdx: 0, RenderdIdx: 128, UID: "0000-00-02-0-0x56c0", MaxVFs: 16, Driver: "i915"},
+	}
+	if err := fakesysfs.FakeSysFsGpuContents(testDirs.SysfsRoot, testDirs.DevfsRoot, testDevices, false); err != nil {
+		t.Fatalf("could not create fake sysfs: %v", err)
+	}
+
+	drv, err := getFakeDriver(testDirs)
+	if err != nil {
+		t.Fatalf("could not create fake driver: %v", err)
+	}
+	defer func() { _ = drv.Shutdown(context.TODO()) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set Allocatable to invalid type to test defensive check.
+	drv.state.Allocatable = "invalid type"
+
+	drv.updateHealth(ctx, HealthStatusUpdates{
+		"0000-00-02-0-0x56c0": {"CoreThermal": "OK"},
+	})
+}
+
 func TestUpdateHealth_MultipleDevices(t *testing.T) {
 	testDirs, err := testhelpers.NewTestDirs(gpudevice.DriverName)
 	defer testhelpers.CleanupTest(t, "GPU TestUpdateHealth_MultipleDevices", testDirs.TestRoot)
