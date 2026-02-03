@@ -32,41 +32,8 @@ func (d *driver) startHealthMonitor(ctx context.Context, gpuFlags *GPUFlags) {
 }
 
 func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthStatusUpdates) {
-	response, ok := func() (*drahealthv1alpha1.NodeWatchResourcesResponse, bool) {
-		d.state.Lock()
-		defer d.state.Unlock()
-
-		allocatable, ok := d.state.Allocatable.(map[string]*device.DeviceInfo)
-		if !ok {
-			klog.Error("allocatable devices not in expected format")
-			return nil, false
-		}
-		for deviceUID, healthStatus := range healthStatusUpdates {
-			klog.Infof("Updating info for device %v to status=%v", deviceUID, healthStatus)
-			foundDevice, found := allocatable[deviceUID]
-			if !found {
-				klog.Errorf("could not find allocatable device with UID %v", deviceUID)
-				return nil, false
-			}
-
-			// Determine overall health: healthy unless any status is CRITICAL.
-			isHealthy := true
-			if foundDevice.HealthStatus == nil {
-				foundDevice.HealthStatus = make(map[string]string)
-			}
-			for healthType, status := range healthStatusUpdates[deviceUID] {
-				foundDevice.HealthStatus[healthType] = status
-				health := d.state.StatusHealth(status)
-				isHealthy = isHealthy && health
-			}
-			foundDevice.Healthy = isHealthy
-		}
-
-		// Build health response while still holding the lock to ensure consistency.
-		return d.buildHealthResponseLocked(), true
-	}()
-
-	if !ok {
+	if err := d.applyHealthDeltas(healthStatusUpdates); err != nil {
+		klog.Errorf("could not apply health deltas: %v", err)
 		return
 	}
 
@@ -74,8 +41,39 @@ func (d *driver) updateHealth(ctx context.Context, healthStatusUpdates HealthSta
 		klog.Errorf("could not publish updated resource slice: %v", err)
 	}
 
+	response := d.buildHealthResponse()
 	// Broadcast health update to all connected health streams.
 	d.broadcastHealthUpdateWithResponse(response)
+}
+
+func (d *driver) applyHealthDeltas(healthDeltas HealthStatusUpdates) error {
+	d.state.Lock()
+	defer d.state.Unlock()
+
+	//nolint:forcetypeassert // We want the code to panic if our assumption turns out to be wrong.
+	allocatable := d.state.Allocatable.(map[string]*device.DeviceInfo)
+
+	for deviceUID, healthStatus := range healthDeltas {
+		klog.Infof("Updating info for device %v to status=%v", deviceUID, healthStatus)
+		foundDevice, found := allocatable[deviceUID]
+		if !found {
+			return fmt.Errorf("could not find allocatable device with UID %v", deviceUID)
+		}
+
+		// Determine overall health: healthy unless any status is CRITICAL.
+		isHealthy := true
+		if foundDevice.HealthStatus == nil {
+			foundDevice.HealthStatus = make(map[string]string)
+		}
+		for healthType, status := range healthDeltas[deviceUID] {
+			foundDevice.HealthStatus[healthType] = status
+			health := d.state.StatusHealth(status)
+			isHealthy = isHealthy && health
+		}
+		foundDevice.Healthy = isHealthy
+	}
+
+	return nil
 }
 
 // watchGPUHealthStatuses polls XPUM metric health info and sends per-interval
@@ -170,19 +168,10 @@ func (d *driver) buildHealthResponse() *drahealthv1alpha1.NodeWatchResourcesResp
 	d.state.Lock()
 	defer d.state.Unlock()
 
-	return d.buildHealthResponseLocked()
-}
-
-// buildHealthResponseLocked builds a NodeWatchResourcesResponse with current health status.
-// Caller must hold d.state lock.
-func (d *driver) buildHealthResponseLocked() *drahealthv1alpha1.NodeWatchResourcesResponse {
 	devices := make([]*drahealthv1alpha1.DeviceHealth, 0)
 
-	allocatable, ok := d.state.Allocatable.(map[string]*device.DeviceInfo)
-	if !ok {
-		klog.Warning("Allocatable devices not in expected format")
-		return &drahealthv1alpha1.NodeWatchResourcesResponse{Devices: devices}
-	}
+	//nolint:forcetypeassert // We want the code to panic if our assumption turns out to be wrong.
+	allocatable := d.state.Allocatable.(map[string]*device.DeviceInfo)
 
 	for _, dev := range allocatable {
 		deviceHealth := d.deviceInfoToDeviceHealth(dev)
