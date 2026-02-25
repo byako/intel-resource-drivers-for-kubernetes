@@ -24,10 +24,11 @@ import (
 	"strconv"
 	"strings"
 
+	deviceAttribute "k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/klog/v2"
+
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/gaudi/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
-
-	"k8s.io/klog/v2"
 )
 
 // Detect devices from sysfs.
@@ -47,11 +48,11 @@ func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo
 		return devices
 	}
 
-	return scanDevicesFromDriverDirFiles(driverDirFiles, sysfsDriverDir, namingStyle)
+	return scanDevicesFromDriverDirFiles(driverDirFiles, sysfsDriverDir, namingStyle, sysfsDir)
 
 }
 
-func scanDevicesFromDriverDirFiles(driverDirFiles []os.DirEntry, sysfsDriverDir string, namingStyle string) map[string]*device.DeviceInfo {
+func scanDevicesFromDriverDirFiles(driverDirFiles []os.DirEntry, sysfsDriverDir, namingStyle, sysfsDir string) map[string]*device.DeviceInfo {
 	devices := map[string]*device.DeviceInfo{}
 	for _, pciAddress := range driverDirFiles {
 		devicePCIAddress := pciAddress.Name()
@@ -101,12 +102,20 @@ func scanDevicesFromDriverDirFiles(driverDirFiles []os.DirEntry, sysfsDriverDir 
 			Healthy:    true,
 		}
 
-		linkSource := path.Join(sysfsDriverDir, devicePCIAddress)
-		pciRoot, err := helpers.DeterminePCIRoot(linkSource)
+		/*
+			linkSource := path.Join(sysfsDriverDir, devicePCIAddress)
+			pciRoot, err := helpers.DeterminePCIRoot(linkSource)
+			if err != nil {
+				klog.Warningf("could not detect PCI root complex for %v: %v", devicePCIAddress, err)
+			} else {
+				newDeviceInfo.PCIRoot = pciRoot
+			}
+		*/
+		pciRootAttribute, err := deviceAttribute.GetPCIeRootAttributeByPCIBusID(devicePCIAddress, deviceAttribute.WithFSFromRoot(sysfsDir))
 		if err != nil {
 			klog.Warningf("could not detect PCI root complex for %v: %v", devicePCIAddress, err)
 		} else {
-			newDeviceInfo.PCIRoot = pciRoot
+			newDeviceInfo.PCIRoot = *pciRootAttribute.Value.StringValue
 		}
 
 		// Set user-friendly ModelName field.

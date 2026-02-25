@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -89,6 +88,7 @@ func DeviceUIDFromPCIinfo(pciAddress string, pciid string) string {
 	return newUID
 }
 
+/*
 func DeterminePCIRoot(link string) (string, error) {
 	// e.g. /sys/devices/pci0000:16/0000:16:02.0/0000:17:00.0/0000:18:00.0/0000:19:00.0
 	linkTarget, err := filepath.EvalSymlinks(link)
@@ -117,3 +117,4 @@ func DeterminePCIRoot(link string) (string, error) {
 
 	return "", fmt.Errorf("could not parse sysfs link target %v: %v", linkTarget, parts)
 }
+*/

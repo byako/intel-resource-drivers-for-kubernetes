@@ -25,12 +25,13 @@ import (
 	"strconv"
 	"strings"
 
+	deviceAttribute "k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/klog/v2"
+
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/goxpusmi"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/gpu/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/gpu/drm"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
-
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -63,7 +64,7 @@ func DiscoverDevices(sysfsDir, namingStyle string, verbose bool, withXpuSmi bool
 			klog.Errorf("could not read sysfs directory: %v", err)
 			continue
 		}
-		moreDevices := processSysfsDriverDir(files, driverName, sysfsDriverDir, sysfsDRMDir, namingStyle)
+		moreDevices := processSysfsDriverDir(files, driverName, sysfsDriverDir, sysfsDRMDir, namingStyle, sysfsDir)
 		maps.Copy(devices, moreDevices)
 	}
 
@@ -82,7 +83,7 @@ func populateXpuDeviceDetails(verbose bool) {
 	}
 }
 
-func processSysfsDriverDir(files []os.DirEntry, driverName string, sysfsDriverDir string, sysfsDRMDir string, namingStyle string) map[string]*device.DeviceInfo {
+func processSysfsDriverDir(files []os.DirEntry, driverName, sysfsDriverDir, sysfsDRMDir, namingStyle, sysfsDir string) map[string]*device.DeviceInfo {
 	devices := make(map[string]*device.DeviceInfo)
 
 	for _, pciAddress := range files {
@@ -127,12 +128,21 @@ func processSysfsDriverDir(files []os.DirEntry, driverName string, sysfsDriverDi
 		newDeviceInfo.RenderdIdx = renderdIdx
 		newDeviceInfo.MemoryMiB = getLocalMemoryAmountMiB(devicePCIAddress)
 
-		linkSource := path.Join(sysfsDriverDir, devicePCIAddress)
-		pciRoot, err := helpers.DeterminePCIRoot(linkSource)
+		// TODO: DELETEME:
+		// testing https://github.com/kubernetes/kubernetes/pull/137220/changes
+		/*		linkSource := path.Join(sysfsDriverDir, devicePCIAddress)
+				pciRoot, err := helpers.DeterminePCIRoot(linkSource)
+				if err != nil {
+					klog.Warningf("could not detect PCI root complex for %v: %v", devicePCIAddress, err)
+				} else {
+					newDeviceInfo.PCIRoot = pciRoot
+				}
+		*/
+		pciRootAttribute, err := deviceAttribute.GetPCIeRootAttributeByPCIBusID(devicePCIAddress, deviceAttribute.WithFSFromRoot(sysfsDir))
 		if err != nil {
 			klog.Warningf("could not detect PCI root complex for %v: %v", devicePCIAddress, err)
 		} else {
-			newDeviceInfo.PCIRoot = pciRoot
+			newDeviceInfo.PCIRoot = *pciRootAttribute.Value.StringValue
 		}
 
 		detectSRIOV(newDeviceInfo, sysfsDriverDir, devicePCIAddress, deviceId)
